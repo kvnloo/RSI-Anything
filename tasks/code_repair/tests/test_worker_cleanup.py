@@ -49,6 +49,31 @@ class WorkerCleanup(unittest.TestCase):
                         process.kill()
                     process.wait()
 
+    def test_failed_shard_is_requeued_with_clean_output(self):
+        popen, sleep, calls = subprocess.Popen, time.sleep, []
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            (output / 'logs').mkdir()
+            (output / 'public').mkdir()
+
+            def launch(command, **kwargs):
+                seed, shard = command[command.index('--seed') + 1], command[command.index('--shard') + 1]
+                calls.append((seed, shard))
+                first = calls.count((seed, shard)) == 1
+                partial = output / 'public' / f'seed{seed}.shard{shard}.jsonl'
+                self.assertFalse(partial.exists())
+                if first and (seed, shard) == ('1', '2'):
+                    partial.write_text('{}\n')  # partial rows from the run that dies
+                    return popen([sys.executable, '-c', 'raise SystemExit(1)'], **kwargs)
+                return popen([sys.executable, '-c', ''], **kwargs)
+
+            with patch('evaluation.subprocess.Popen', side_effect=launch), \
+                 patch('evaluation.time', SimpleNamespace(sleep=lambda s: sleep(.01), time=time.time, monotonic=time.monotonic)):
+                run_workers(SimpleNamespace(gpus='0', worker_retries=2, retry_backoff=0), output, output)
+            self.assertEqual(len(calls), 25)
+            self.assertEqual(calls.count(('1', '2')), 2)
+            self.assertTrue((output / 'logs' / 'seed1.shard2.attempt1.log').exists())
+
     def test_failure_stops_other_workers(self):
         self.exercise()
 

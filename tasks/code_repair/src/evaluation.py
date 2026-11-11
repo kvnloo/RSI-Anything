@@ -294,7 +294,7 @@ def run_workers(args, assets, output):
     if not devices or len(set(devices)) != len(devices) or not all(d.isdigit() for d in devices):
         raise ValueError('gpus must list unique nonnegative GPU IDs')
     jobs = [(seed, shard) for shard in range(8) for seed in range(3)]
-    running = {}
+    running, attempts, retries = {}, {}, getattr(args, 'worker_retries', 0)
 
     def interrupted(signum, frame):
         raise KeyboardInterrupt('Evaluation interrupted')
@@ -307,9 +307,18 @@ def run_workers(args, assets, output):
                 if code is None:
                     continue
                 log.close()
-                if code:
-                    raise RuntimeError(f'Worker seed={seed} shard={shard} failed; inspect logs')
                 del running[device]
+                if code:
+                    tries = attempts[(seed, shard)] = attempts.get((seed, shard), 0) + 1
+                    if tries > retries:
+                        raise RuntimeError(f'Worker seed={seed} shard={shard} failed; inspect logs')
+                    # A shard is a pure function of its inputs: drop its partial rows, keep the log, requeue it.
+                    name = f'seed{seed}.shard{shard}'
+                    for suffix in ('.jsonl', '.status.json'):
+                        (output / 'public' / (name + suffix)).unlink(missing_ok=True)
+                    (output / 'logs' / (name + '.log')).rename(output / 'logs' / f'{name}.attempt{tries}.log')
+                    jobs.insert(0, (seed, shard))
+                    time.sleep(getattr(args, 'retry_backoff', 60))
             for device in devices:
                 if device in running or not jobs:
                     continue

@@ -19,6 +19,8 @@ def main():
             p.add_argument('--checkpoint', type=Path)
             p.add_argument('--inputs', choices=['recorded', 'recorded-forced', 'fresh'], default='recorded')
             p.add_argument('--judge-workers', type=int, default=64)
+            p.add_argument('--worker-retries', type=int, default=0,
+                           help='requeue a failed shard (e.g. CUDA OOM from a shared GPU) up to N times')
         elif name == 'train':
             p.add_argument('--stage', choices=['initial', 'semantic', 'expanded', 'incumbent', 'all'], required=True)
             p.add_argument('--parent', type=Path)
