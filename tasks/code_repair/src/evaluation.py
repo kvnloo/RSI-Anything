@@ -34,6 +34,46 @@ def choose(predictions):
     return best if utility[best] > utility[4] else 4
 
 
+RECORDED = ('recorded', 'recorded-forced')
+GAP_BINS = (0, .001, .002, .005, .01, .02, .05, .1, .2, math.inf)
+
+
+def decide(predictions, forced=None):
+    """Return (followed index, our index). Teacher forcing follows the recorded reference choice."""
+    ours = choose(predictions)
+    return (ours if forced is None else forced), ours
+
+
+def agreement(rows):
+    """Decision agreement of our world model with the followed reference path (recorded-forced runs)."""
+    steps, gaps, episodes, stepped = 0, [], 0, 0
+    for row in rows:
+        same = True
+        for t in row['trace']:
+            utility = [p['utility'] for p in t['predictions']]
+            steps += 1
+            if t['our_choice'] != t['selected_index']:
+                same = False
+                gaps.append(dict(task_id=row['task_id'], seed=row['seed'], step=t['step'], our_choice=t['our_choice'],
+                                 reference_choice=t['selected_index'],
+                                 gap=utility[t['our_choice']] - utility[t['selected_index']]))
+        episodes += same
+        stepped += bool(row['trace'])
+    labels = [f'[{a},{b})' for a, b in zip(GAP_BINS, GAP_BINS[1:])]
+    histogram = {label: sum(a <= g['gap'] < b for g in gaps) for label, a, b in zip(labels, GAP_BINS, GAP_BINS[1:])}
+    values = sorted(g['gap'] for g in gaps)
+    return dict(decision_steps=steps, steps_agreeing=steps - len(gaps),
+                step_agreement=(steps - len(gaps)) / steps if steps else 1.0,
+                episodes=len(rows), episodes_agreeing=episodes, episode_agreement=episodes / len(rows) if rows else 1.0,
+                episodes_with_decisions=stepped,
+                episodes_with_decisions_agreeing=episodes - (len(rows) - stepped),
+                disagreements=len(gaps), gap_histogram=histogram,
+                gap_max=values[-1] if values else 0.0,
+                gap_median=values[len(values) // 2] if values else 0.0,
+                gap_p95=values[min(len(values) - 1, int(.95 * len(values)))] if values else 0.0,
+                disagreement_details=gaps)
+
+
 class Predictor:
     def __init__(self, checkpoint, backbone):
         from semantic_world import SemanticExecutionWorld
@@ -76,10 +116,13 @@ def worker(args):
     model = Predictor(protocol['checkpoint'], assets / 'models/world')
     assert model.identity == protocol['world_identity']
     coder = None
-    if protocol['inputs'] == 'fresh':
+    if protocol['inputs'] not in RECORDED:
         from coder import FrozenCoder
         coder = FrozenCoder(assets / 'models/policy')
     conf = experiment()
+    forced = protocol['inputs'] == 'recorded-forced'
+    reference = {row['task_id']: row['choices'] for row in lines(assets / 'reference/decisions.jsonl')
+                 if row['seed'] == args.seed} if forced else {}
     items = [row for i, row in enumerate(lines(assets / f'public/seed{args.seed}.jsonl')) if i % 8 == args.shard]
     path = output / 'public' / f'seed{args.seed}.shard{args.shard}.jsonl'
     assert not path.exists() and len(items) == 25
@@ -107,7 +150,7 @@ def worker(args):
                 assert len(raw) == 4
                 candidates = tuple(Candidate(row['candidate_id'], row['code']) for row in raw) + (Candidate('keep_current', code),)
                 predictions = model.predict(item['problem'], code, feedback, tests, candidates)
-                choice = choose(predictions)
+                choice, ours = decide(predictions, reference[item['task_id']][step] if forced else None)
                 before, previous = code, feedback
                 code = candidates[choice].code
                 if coder is None:
@@ -119,7 +162,9 @@ def worker(args):
                     feedback = execute(code, tests, timeout=item['timeout'])
                 trace.append(dict(step=step, current_code=before, previous_feedback=asdict(previous),
                     candidates=[asdict(c) for c in candidates], predictions=predictions,
-                    selected_index=choice, visible=asdict(feedback)))
+                    selected_index=choice, visible=asdict(feedback), **(dict(our_choice=ours) if forced else {})))
+            if forced:
+                assert [t['selected_index'] for t in trace] == reference[item['task_id']]
             row = dict(task_id=item['task_id'], seed=args.seed, initial_code=item['initial_code'],
                 final_code=code, trace=trace, protocol_sha256=seal, world_identity=model.identity,
                 hidden_tests_accessed=False, optimizer_steps=0)
@@ -133,6 +178,8 @@ def worker(args):
 def seal_public(assets, output):
     config = experiment()
     protocol_sha = sha(output / 'protocol.json')
+    forced = read(output / 'protocol.json')['inputs'] == 'recorded-forced'
+    reference = {(row['task_id'], row['seed']): row['choices'] for row in lines(assets / 'reference/decisions.jsonl')}
     rows, files = [], {}
     for seed in range(3):
         originals = {row['task_id']: row for row in lines(assets / f'public/seed{seed}.jsonl')}
@@ -150,9 +197,15 @@ def seal_public(assets, output):
                     assert transition['step'] == step and transition['current_code'] == code
                     assert len(transition['candidates']) == 5
                     assert transition['candidates'][4]['code'] == code
-                    assert transition['selected_index'] == choose(transition['predictions'])
+                    if forced:
+                        assert transition['our_choice'] == choose(transition['predictions'])
+                        assert transition['selected_index'] == reference[(row['task_id'], row['seed'])][step]
+                    else:
+                        assert transition['selected_index'] == choose(transition['predictions'])
                     code = transition['candidates'][transition['selected_index']]['code']
                 assert code == row['final_code']
+                if forced:
+                    assert len(row['trace']) == len(reference[(row['task_id'], row['seed'])])
             files[path.name] = sha(path)
             rows.extend(batch)
     expected = {(tid, seed) for tid in config['evaluation']['tasks'] for seed in range(3)}
@@ -202,9 +255,13 @@ def judge(assets, output, rows, workers):
     summary = dict(records=600, independent_tasks=200, successes=sum(per_seed), rate=sum(per_seed) / 600,
         per_seed_successes=per_seed, reference_decisions_matched=matches,
         reference_counts_matched=per_seed == experiment()['reference']['per_seed_successes'],
-        hidden_results_recomputed=True, recorded_public_inputs=read(output / 'protocol.json')['inputs'] == 'recorded',
+        hidden_results_recomputed=True, inputs=read(output / 'protocol.json')['inputs'],
+        recorded_public_inputs=read(output / 'protocol.json')['inputs'] in RECORDED,
+        reference_per_seed_successes=experiment()['reference']['per_seed_successes'],
         protocol_sha256=sha(output / 'protocol.json'), results_sha256=sha(output / 'results.jsonl'),
         all_decisions_sealed_before_hidden_judge=True, time=time.time())
+    if summary['inputs'] == 'recorded-forced':
+        summary['decision_agreement'] = agreement(rows)
     atomic_json(output / 'summary.json', summary)
     atomic_json(output / 'complete.json', dict(status='COMPLETE', summary_sha256=sha(output / 'summary.json')))
     print(json.dumps(summary), flush=True)

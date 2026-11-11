@@ -17,7 +17,7 @@ def main():
         if name == 'evaluate':
             p.add_argument('--gpus', default='0,1,2,3,4,5,6,7')
             p.add_argument('--checkpoint', type=Path)
-            p.add_argument('--inputs', choices=['recorded', 'fresh'], default='recorded')
+            p.add_argument('--inputs', choices=['recorded', 'recorded-forced', 'fresh'], default='recorded')
             p.add_argument('--judge-workers', type=int, default=64)
         elif name == 'train':
             p.add_argument('--stage', choices=['initial', 'semantic', 'expanded', 'incumbent', 'all'], required=True)

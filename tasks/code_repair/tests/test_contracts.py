@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from evaluation import choose, state_key
+from evaluation import agreement, choose, decide, state_key
 from fixtures import execution_from_dict
 from io_utils import lines
 
@@ -16,6 +16,23 @@ class DecisionContracts(unittest.TestCase):
         self.assertEqual(choose(values), 4)
         values[4]['utility'] = .29
         self.assertEqual(choose(values), 0)
+
+    def test_teacher_forcing_follows_reference_and_logs_own_choice(self):
+        values = [dict(utility=x) for x in [.3, .5, .2, .1, .4]]
+        self.assertEqual(decide(values), (1, 1))
+        self.assertEqual(decide(values, forced=4), (4, 1))
+
+    def test_agreement_reports_gap_of_each_disagreement(self):
+        u = lambda *x: [dict(utility=v) for v in x]
+        rows = [dict(task_id='a', seed=0, trace=[dict(step=0, predictions=u(.3, .5, .2, .1, .4), our_choice=1, selected_index=1),
+                                                  dict(step=1, predictions=u(.3, .5, .2, .1, .4), our_choice=1, selected_index=4)]),
+                dict(task_id='b', seed=1, trace=[dict(step=0, predictions=u(.3, .2, .2, .1, .1), our_choice=0, selected_index=0)]),
+                dict(task_id='c', seed=2, trace=[])]
+        out = agreement(rows)
+        self.assertEqual((out['decision_steps'], out['steps_agreeing'], out['disagreements']), (3, 2, 1))
+        self.assertEqual((out['episodes_agreeing'], out['episodes_with_decisions'], out['episodes_with_decisions_agreeing']), (2, 2, 1))
+        self.assertAlmostEqual(out['disagreement_details'][0]['gap'], .1)
+        self.assertEqual(out['gap_histogram']['[0.1,0.2)'] + out['gap_histogram']['[0.05,0.1)'], 1)
 
     def test_invalid_score_rejected(self):
         with self.assertRaises(ValueError):
